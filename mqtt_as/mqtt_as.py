@@ -12,9 +12,9 @@ import ustruct as struct
 gc.collect()
 from ubinascii import hexlify
 import uasyncio as asyncio
-
+from condition import Condition
 gc.collect()
-from utime import ticks_ms, ticks_diff
+from utime import ticks_ms, ticks_diff, time
 from uerrno import EINPROGRESS, ETIMEDOUT
 
 gc.collect()
@@ -24,6 +24,10 @@ import network
 
 gc.collect()
 from sys import platform
+
+import logging
+log = logging.getLogger(__name__)
+gc.collect()
 
 VERSION = (0, 6, 0)
 
@@ -42,6 +46,42 @@ ESP8266 = platform == 'esp8266'
 ESP32 = platform == 'esp32'
 PYBOARD = platform == 'pyboard'
 LOBO = platform == 'esp32_LoBo'
+
+# Message state
+mqtt_ms_invalid = 0
+mqtt_ms_publish = 1
+mqtt_ms_wait_for_puback = 2
+mqtt_ms_wait_for_pubrec = 3
+mqtt_ms_resend_pubrel = 4
+mqtt_ms_wait_for_pubrel = 5
+mqtt_ms_resend_pubcomp = 6
+mqtt_ms_wait_for_pubcomp = 7
+mqtt_ms_send_pubrec = 8
+mqtt_ms_queued = 9
+# Error values
+MQTT_ERR_AGAIN = -1
+MQTT_ERR_SUCCESS = 0
+MQTT_ERR_NOMEM = 1
+MQTT_ERR_PROTOCOL = 2
+MQTT_ERR_INVAL = 3
+MQTT_ERR_NO_CONN = 4
+MQTT_ERR_CONN_REFUSED = 5
+MQTT_ERR_NOT_FOUND = 6
+MQTT_ERR_CONN_LOST = 7
+MQTT_ERR_TLS = 8
+MQTT_ERR_PAYLOAD_SIZE = 9
+MQTT_ERR_NOT_SUPPORTED = 10
+MQTT_ERR_AUTH = 11
+MQTT_ERR_ACL_DENIED = 12
+MQTT_ERR_UNKNOWN = 13
+MQTT_ERR_ERRNO = 14
+MQTT_ERR_QUEUE_SIZE = 15
+
+MQTT_CLIENT = 0
+MQTT_BRIDGE = 1
+
+time_func = time
+
 
 
 # Default "do little" coro for optional user replacement
@@ -67,6 +107,7 @@ config = {
     'subs_cb':       lambda *_: None,
     'wifi_coro':     eliza,
     'connect_coro':  eliza,
+    'on_publish':    eliza,
     'ssid':          None,
     'wifi_pw':       None,
 }
@@ -76,11 +117,11 @@ class MQTTException(Exception):
     pass
 
 
-def pid_gen():
-    pid = 0
+def mid_gen():
+    mid = 0
     while True:
-        pid = pid + 1 if pid < 65535 else 1
-        yield pid
+        mid = mid + 1 if mid < 65535 else 1
+        yield mid
 
 
 def qos_check(qos):
@@ -117,9 +158,10 @@ class MQTT_base:
         self._ssl = config['ssl']
         self._ssl_params = config['ssl_params']
         # Callbacks and coros
-        self._cb = config['subs_cb']
+        self._on_message = config['subs_cb']
         self._wifi_handler = config['wifi_coro']
-        self._connect_handler = config['connect_coro']
+        self._on_connect = config['connect_coro']
+        self._on_publish = config['on_publish']
         # Network
         self.port = config['port']
         if self.port == 0:
@@ -131,8 +173,8 @@ class MQTT_base:
         self._sta_if = network.WLAN(network.STA_IF)
         self._sta_if.active(True)
 
-        self.newpid = pid_gen()
-        self.rcv_pids = set()  # PUBACK and SUBACK pids awaiting ACK response
+        self.newmid = mid_gen()
+        self.rcv_mids = set()  # PUBACK and SUBACK mids awaiting ACK response
         self.last_rx = ticks_ms()  # Time of last communication from broker
         self.lock = asyncio.Lock()
 
@@ -144,10 +186,6 @@ class MQTT_base:
         self._lw_msg = msg
         self._lw_qos = qos
         self._lw_retain = retain
-
-    def dprint(self, *args):
-        if self.DEBUG:
-            print(*args)
 
     def _timeout(self, t):
         return ticks_diff(ticks_ms(), t) > self._response_time
@@ -219,7 +257,7 @@ class MQTT_base:
             if e.args[0] not in BUSY_ERRORS:
                 raise
         await asyncio.sleep_ms(_DEFAULT_MS)
-        self.dprint('Connecting to broker.')
+        log.info('Connecting to broker.')
         if self._ssl:
             import ussl
             self._sock = ussl.wrap_socket(self._sock, **self._ssl_params)
@@ -257,7 +295,7 @@ class MQTT_base:
         # Await CONNACK
         # read causes ECONNABORTED if broker is out; triggers a reconnect.
         resp = await self._as_read(4)
-        self.dprint('Connected to broker.')  # Got CONNACK
+        log.info('Connected to broker.')  # Got CONNACK
         if resp[3] != 0 or resp[0] != 0x20 or resp[1] != 0x02:
             raise OSError(-1)  # Bad CONNACK e.g. authentication fail.
 
@@ -317,72 +355,114 @@ class MQTT_base:
         if self._sock is not None:
             self._sock.close()
 
-    async def _await_pid(self, pid):
+    async def _await_mid(self, mid):
         t = ticks_ms()
-        while pid in self.rcv_pids:  # local copy
+        while mid in self.rcv_mids:  # local copy
             if self._timeout(t) or not self.isconnected():
                 break  # Must repub or bail out
             await asyncio.sleep_ms(100)
         else:
-            return True  # PID received. All done.
+            return True  # mid received. All done.
         return False
 
-    # qos == 1: coro blocks until wait_msg gets correct PID.
-    # If WiFi fails completely subclass re-publishes with new PID.
-    async def publish(self, topic, msg, retain, qos):
-        pid = next(self.newpid)
+    # qos == 1: coro blocks until wait_msg gets correct mid.
+    # If WiFi fails completely subclass re-publishes with new mid.
+    async def publish(self, topic, payload=None, retain=False, qos=0):
+        log.info("publish: \n topic: {}\n payload: {}\n retain: {}\n qos: {}".format(topic,payload,retain,qos))
+
+        if topic is None or len(topic) == 0:
+            raise ValueError('Invalid topic.')
+        if qos < 0 or qos > 2: # qos = 0,1,2
+            raise ValueError('Invalid QoS level.')
+
+        if isinstance(payload,dict):
+            try: local_payload = dumps(payload)
+            except: from json import dumps; local_payload = dumps(payload)
+        elif isinstance(payload, (bytes, bytearray)):
+            local_payload = payload
+        # elif isinstance(payload, unicode):
+        #     local_payload = payload.encode('utf-8')
+        elif isinstance(payload, (int, float)):
+            local_payload = str(payload).encode('ascii')
+        elif isinstance(payload,str):
+            local_payload = payload
+        elif payload is None:
+            local_payload = b''
+        else:
+            log.info('Payload type: {}'.format(type(payload)))
+            raise TypeError(
+                'payload must be a string, bytearray, int, float or None.')
+        if len(local_payload) > 268435455:
+            raise ValueError('Payload too large.')
+
+        local_mid = next(self.newmid)
+        info = MQTTMessageInfo(local_mid)
         if qos:
-            self.rcv_pids.add(pid)
+            self.rcv_mids.add(local_mid)
+
+        # Do publish
         async with self.lock:
-            await self._publish(topic, msg, retain, qos, 0, pid)
+            info.rc = await self._publish(topic, local_payload, retain, qos, 0, local_mid)
+        # Do on publish callback if we arren't ensuring delivery
         if qos == 0:
-            return
+            await self._on_publish(topic, payload, info)
+            return info
+        #else:
+        #    message = MQTTMessage(local_mid)
 
         count = 0
         while 1:  # Await PUBACK, republish on timeout
-            if await self._await_pid(pid):
-                return
-            # No match
+            # If we recieve a mid that we are waiting for, then we are done
+            if await self._await_mid(local_mid):
+                return info
+            # If we have tried more than our max tries or if we are disconnected
             if count >= self._max_repubs or not self.isconnected():
-                raise OSError(-1)  # Subclass to re-publish with new PID
+                # throw error, subclass will republish with new PID???
+                raise OSError(-1)  
+            # Try to publish again
             async with self.lock:
-                await self._publish(topic, msg, retain, qos, dup=1, pid=pid)  # Add pid
+                info.rc = await self._publish(topic, local_payload, retain, qos, dup=1, mid=local_mid)  # Add mid
+
             count += 1
             self.REPUB_COUNT += 1
 
-    async def _publish(self, topic, msg, retain, qos, dup, pid):
-        pkt = bytearray(b"\x30\0\0\0")
-        pkt[0] |= qos << 1 | retain | dup << 3
-        sz = 2 + len(topic) + len(msg)
-        if qos > 0:
-            sz += 2
-        if sz >= 2097152:
-            raise MQTTException('Strings too long.')
-        i = 1
-        while sz > 0x7f:
-            pkt[i] = (sz & 0x7f) | 0x80
-            sz >>= 7
-            i += 1
-        pkt[i] = sz
-        await self._as_write(pkt, i + 1)
-        await self._send_str(topic)
-        if qos > 0:
-            struct.pack_into("!H", pkt, 0, pid)
-            await self._as_write(pkt, 2)
-        await self._as_write(msg)
+    async def _publish(self, topic, msg, retain, qos, dup, mid):
+        try:
+            pkt = bytearray(b"\x30\0\0\0")
+            pkt[0] |= qos << 1 | retain | dup << 3
+            sz = 2 + len(topic) + len(msg)
+            if qos > 0:
+                sz += 2
+            if sz >= 2097152:
+                return 9 # string to long, return rc 9 TB_ERR_PAYLOAD_SIZE
+            i = 1
+            while sz > 0x7f:
+                pkt[i] = (sz & 0x7f) | 0x80
+                sz >>= 7
+                i += 1
+            pkt[i] = sz
+            await self._as_write(pkt, i + 1)
+            await self._send_str(topic)
+            if qos > 0:
+                struct.pack_into("!H", pkt, 0, mid)
+                await self._as_write(pkt, 2)
+            await self._as_write(msg)
+            return 0 # success
+        except:
+            return 13  # unknown error
 
     # Can raise OSError if WiFi fails. Subclass traps
     async def subscribe(self, topic, qos):
         pkt = bytearray(b"\x82\0\0\0")
-        pid = next(self.newpid)
-        self.rcv_pids.add(pid)
-        struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, pid)
+        mid = next(self.newmid)
+        self.rcv_mids.add(mid)
+        struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, mid)
         async with self.lock:
             await self._as_write(pkt)
             await self._send_str(topic)
             await self._as_write(qos.to_bytes(1, "little"))
 
-        if not await self._await_pid(pid):
+        if not await self._await_mid(mid):
             raise OSError(-1)
 
     # Wait for a single incoming MQTT message and process it.
@@ -402,14 +482,14 @@ class MQTT_base:
             return
         op = res[0]
 
-        if op == 0x40:  # PUBACK: save pid
+        if op == 0x40:  # PUBACK: save mid
             sz = await self._as_read(1)
             if sz != b"\x02":
                 raise OSError(-1)
-            rcv_pid = await self._as_read(2)
-            pid = rcv_pid[0] << 8 | rcv_pid[1]
-            if pid in self.rcv_pids:
-                self.rcv_pids.discard(pid)
+            rcv_mid = await self._as_read(2)
+            mid = rcv_mid[0] << 8 | rcv_mid[1]
+            if mid in self.rcv_mids:
+                self.rcv_mids.discard(mid)
             else:
                 raise OSError(-1)
 
@@ -417,9 +497,9 @@ class MQTT_base:
             resp = await self._as_read(4)
             if resp[3] == 0x80:
                 raise OSError(-1)
-            pid = resp[2] | (resp[1] << 8)
-            if pid in self.rcv_pids:
-                self.rcv_pids.discard(pid)
+            mid = resp[2] | (resp[1] << 8)
+            if mid in self.rcv_mids:
+                self.rcv_mids.discard(mid)
             else:
                 raise OSError(-1)
 
@@ -431,22 +511,22 @@ class MQTT_base:
         topic = await self._as_read(topic_len)
         sz -= topic_len + 2
         if op & 6:
-            pid = await self._as_read(2)
-            pid = pid[0] << 8 | pid[1]
+            mid = await self._as_read(2)
+            mid = mid[0] << 8 | mid[1]
             sz -= 2
         msg = await self._as_read(sz)
         retained = op & 0x01
-        self._cb(topic, msg, bool(retained))
+        try: await self._on_message(topic, msg, bool(retained))
+        except: self._on_message(topic, msg, bool(retained))
         if op & 6 == 2:  # qos 1
             pkt = bytearray(b"\x40\x02\0\0")  # Send PUBACK
-            struct.pack_into("!H", pkt, 2, pid)
+            struct.pack_into("!H", pkt, 2, mid)
             await self._as_write(pkt)
         elif op & 6 == 4:  # qos 2 not supported
             raise OSError(-1)
 
 
 # MQTTClient class. Handles issues relating to connectivity.
-
 class MQTTClient(MQTT_base):
     def __init__(self, config):
         super().__init__(config)
@@ -480,9 +560,23 @@ class MQTTClient(MQTT_base):
                 s.connect(self._ssid, self._wifi_pw)
                 while s.status() == network.STAT_CONNECTING:  # Break out on fail or success. Check once per sec.
                     await asyncio.sleep(1)
+        elif ESP32:
+            from wifimgr import get_connection
+            try:
+                s = get_connection()                
+            except Exception as e:
+                log.info('using ssid: %s' %self._ssid)
+                log.info('using password: %s' %self._wifi_pw)
+                log.info('Error connecting to wifi..: {}'.format(e))
         else:
             s.active(True)
-            s.connect(self._ssid, self._wifi_pw)
+            try:
+                s.connect(str(self._ssid), str(self._wifi_pw))
+            except Exception as e:
+                log.info('using ssid: %s' %self._ssid)
+                log.info('using password: %s' %self._wifi_pw)
+                log.info('Error connecting to wifi..: {}'.format(e))
+                
             if PYBOARD:  # Doesn't yet have STAT_CONNECTING constant
                 while s.status() in (1, 2):
                     await asyncio.sleep(1)
@@ -500,12 +594,12 @@ class MQTTClient(MQTT_base):
         if not s.isconnected():
             raise OSError
         # Ensure connection stays up for a few secs.
-        self.dprint('Checking WiFi integrity.')
+        log.info('Checking WiFi integrity.')
         for _ in range(5):
             if not s.isconnected():
                 raise OSError  # in 1st 5 secs
             await asyncio.sleep(1)
-        self.dprint('Got reliable connection')
+        log.info('Got reliable connection')
 
     async def connect(self):
         if not self._has_connected:
@@ -519,8 +613,9 @@ class MQTTClient(MQTT_base):
             await self._connect(clean)
         except Exception:
             self.close()
+            log.info('FATAL ERROR: Error connecting to broker! Are your credentials correct?')
             raise
-        self.rcv_pids.clear()
+        self.rcv_mids.clear()
         # If we get here without error broker/LAN must be up.
         self._isconnected = True
         self._in_connect = False  # Low level code can now check connectivity.
@@ -535,7 +630,7 @@ class MQTTClient(MQTT_base):
         loop.create_task(self._keep_alive())
         if self.DEBUG:
             loop.create_task(self._memory())
-        loop.create_task(self._connect_handler(self))  # User handler.
+        loop.create_task(self._on_connect(self))  # User handler.
 
     # Launched by .connect(). Runs until connectivity fails. Checks for and
     # handles incoming messages.
@@ -556,7 +651,7 @@ class MQTTClient(MQTT_base):
         while self.isconnected():
             pings_due = ticks_diff(ticks_ms(), self.last_rx) // self._ping_interval
             if pings_due >= 4:
-                self.dprint('Reconnect: broker fail.')
+                log.info('Reconnect: broker fail.')
                 break
             elif pings_due >= 1:
                 try:
@@ -575,7 +670,7 @@ class MQTTClient(MQTT_base):
             count %= 20
             if not count:
                 gc.collect()
-                print('RAM free {} alloc {}'.format(gc.mem_free(), gc.mem_alloc()))
+                log.info('RAM free {} alloc {}'.format(gc.mem_free(), gc.mem_alloc()))
 
     def isconnected(self):
         if self._in_connect:  # Disable low-level check during .connect()
@@ -611,19 +706,19 @@ class MQTTClient(MQTT_base):
                 except OSError:
                     continue
                 if not self._has_connected:  # User has issued the terminal .disconnect()
-                    self.dprint('Disconnected, exiting _keep_connected')
+                    log.info('Disconnected, exiting _keep_connected')
                     break
                 try:
                     await self.connect()
-                    # Now has set ._isconnected and scheduled _connect_handler().
-                    self.dprint('Reconnect OK!')
+                    # Now has set ._isconnected and scheduled _on_connect().
+                    log.info('Reconnect OK!')
                 except OSError as e:
-                    self.dprint('Error in reconnect.', e)
+                    log.info('Error in reconnect: {}'.format(e))
                     # Can get ECONNABORTED or -1. The latter signifies no or bad CONNACK received.
                     self.close()  # Disconnect and try again.
                     self._in_connect = False
                     self._isconnected = False
-        self.dprint('Disconnected, exited _keep_connected')
+        log.info('Disconnected, exited _keep_connected')
 
     async def subscribe(self, topic, qos=0):
         qos_check(qos)
@@ -644,3 +739,124 @@ class MQTTClient(MQTT_base):
             except OSError:
                 pass
             self._reconnect()  # Broker or WiFi fail.
+
+
+
+
+
+
+
+##############################
+
+
+class MQTTMessageInfo(object):
+    """This is a class returned from _publish() and can be used to find
+    out the mid of the message that was published, and to determine whether the
+    message has been published, and/or wait until it is published.
+    """
+
+    __slots__ = 'mid', '_published', '_condition', 'rc', '_iterpos'
+
+    def __init__(self, mid):
+        self.mid = mid
+        self._published = False
+        self._condition = Condition()
+        self.rc = 0
+        self._iterpos = 0
+
+    def __str__(self):
+        return str((self.rc, self.mid))
+
+    def __iter__(self):
+        self._iterpos = 0
+        return self
+
+    def __next__(self):
+        return self.next()
+
+    def next(self):
+        if self._iterpos == 0:
+            self._iterpos = 1
+            return self.rc
+        elif self._iterpos == 1:
+            self._iterpos = 2
+            return self.mid
+        else:
+            raise StopIteration
+
+    def __getitem__(self, index):
+        if index == 0:
+            return self.rc
+        elif index == 1:
+            return self.mid
+        else:
+            raise IndexError("index out of range")
+
+    async def _set_as_published(self):
+        with self._condition:
+            self._published = True
+            self._condition.notify()
+
+    async def wait_for_publish(self):
+        """Block until the message associated with this object is published."""
+        if self.rc == MQTT_ERR_QUEUE_SIZE:
+            raise ValueError('Message is not queued due to ERR_QUEUE_SIZE')
+        with self._condition:
+            while not self._published:
+                self._condition.wait()
+
+    async def is_published(self):
+        """Returns True if the message associated with this object has been
+        published, else returns False."""
+        if self.rc == MQTT_ERR_QUEUE_SIZE:
+            raise ValueError('Message is not queued due to ERR_QUEUE_SIZE')
+        with self._condition:
+            return self._published
+
+
+##############################
+class MQTTMessage(object):
+    """ This is a class that describes an incoming or outgoing message. It is
+    passed to the _on_message callback as the message parameter.
+    Members:
+    topic : String/bytes. topic that the message was published on.
+    payload : String/bytes the message payload.
+    qos : Integer. The message Quality of Service 0, 1 or 2.
+    retain : Boolean. If true, the message is a retained message and not fresh.
+    mid : Integer. The message id.
+    On Python 3, topic must be bytes.
+    """
+
+    __slots__ = 'timestamp', 'state', 'dup', 'mid', '_topic', 'payload', 'qos', 'retain', 'info'
+
+    def __init__(self, mid=0, topic=b""):
+        self.timestamp = time_func()
+        self.state = mqtt_ms_invalid
+        self.dup = False
+        self.mid = mid
+        self._topic = topic
+        self.payload = b""
+        self.qos = 0
+        self.retain = False
+        self.info = MQTTMessageInfo(mid)
+
+    def __eq__(self, other):
+        """Override the default Equals behavior"""
+        if isinstance(other, self.__class__):
+            return self.mid == other.mid
+        return False
+
+    def __ne__(self, other):
+        """Define a non-equality test"""
+        return not self.__eq__(other)
+
+    @property
+    def topic(self):
+        return self._topic.decode('utf-8')
+
+    @topic.setter
+    def topic(self, value):
+        self._topic = value
+
+
+#####################
